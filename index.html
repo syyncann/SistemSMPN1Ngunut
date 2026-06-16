@@ -1492,31 +1492,372 @@ function editAttendance(id) {
     };
 }
 
-function downloadAbsensiExcel(cls, month) {
+function getMonthLabelID(monthValue) {
+    const raw = String(monthValue || '').trim();
+    if (!raw) return 'Semua Bulan';
+    const match = raw.match(/^(\d{4})-(\d{2})$/);
+    if (!match) return raw;
+    const bulan = ['Januari','Februari','Maret','April','Mei','Juni','Juli','Agustus','September','Oktober','November','Desember'];
+    const monthIndex = Number(match[2]) - 1;
+    return `${bulan[monthIndex] || match[2]} ${match[1]}`;
+}
+
+function sanitizeFilename(value) {
+    return String(value || 'Semua')
+        .replace(/[\\/:*?"<>|]+/g, '-')
+        .replace(/\s+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '') || 'Semua';
+}
+
+function getAttendanceStatusSummary(list) {
+    const summary = { HADIR: 0, IZIN: 0, SAKIT: 0, ALPA: 0, TOTAL: 0 };
+    list.forEach(item => {
+        const status = String(item.status || '').toUpperCase().trim();
+        if (Object.prototype.hasOwnProperty.call(summary, status)) summary[status] += 1;
+        summary.TOTAL += 1;
+    });
+    return summary;
+}
+
+function compareClassNameForExport(a, b) {
+    const classes = getClasses();
+    const orderMap = new Map(classes.map((c, index) => [c.class_name, index]));
+    const orderA = orderMap.has(a) ? orderMap.get(a) : 9999;
+    const orderB = orderMap.has(b) ? orderMap.get(b) : 9999;
+    if (orderA !== orderB) return orderA - orderB;
+    return String(a || '').localeCompare(String(b || ''), 'id', { numeric: true, sensitivity: 'base' });
+}
+
+function getAbsensiExportRecords(cls, month) {
     let list = getAttendance();
     if (cls) list = list.filter(a => a.class_id === cls);
-    if (month) list = list.filter(a => a.date.startsWith(month));
+    if (month) list = list.filter(a => a.date && a.date.startsWith(month));
+
+    const classes = getClasses();
+    const orderMap = new Map(classes.map((c, index) => [c.class_name, index]));
+    return [...list].sort((a, b) => {
+        const classOrderA = orderMap.has(a.class_id) ? orderMap.get(a.class_id) : 9999;
+        const classOrderB = orderMap.has(b.class_id) ? orderMap.get(b.class_id) : 9999;
+        if (classOrderA !== classOrderB) return classOrderA - classOrderB;
+
+        const classCompare = String(a.class_id || '').localeCompare(String(b.class_id || ''), 'id', { numeric: true, sensitivity: 'base' });
+        if (classCompare !== 0) return classCompare;
+
+        const dateCompare = String(a.date || '').localeCompare(String(b.date || ''));
+        if (dateCompare !== 0) return dateCompare;
+
+        return String(a.student_name || '').localeCompare(String(b.student_name || ''), 'id', { numeric: true, sensitivity: 'base' });
+    });
+}
+
+function getAttendanceGroupedByClass(list) {
+    const grouped = {};
+    list.forEach(item => {
+        const className = item.class_id || 'Tanpa Kelas';
+        if (!grouped[className]) grouped[className] = [];
+        grouped[className].push(item);
+    });
+    return Object.entries(grouped).sort((a, b) => compareClassNameForExport(a[0], b[0]));
+}
+
+function applyWorksheetStyle(ws, headerRows = []) {
+    if (!ws || !ws['!ref']) return;
+    const range = XLSX.utils.decode_range(ws['!ref']);
+    for (let R = range.s.r; R <= range.e.r; R++) {
+        for (let C = range.s.c; C <= range.e.c; C++) {
+            const cellRef = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[cellRef];
+            if (!cell) continue;
+            cell.s = cell.s || {};
+            cell.s.alignment = { vertical: 'center', wrapText: true };
+            if (headerRows.includes(R)) {
+                cell.s.font = { bold: true };
+                cell.s.fill = { fgColor: { rgb: 'E2E8F0' } };
+            }
+        }
+    }
+}
+
+function downloadAbsensiExcel(cls, month) {
+    const list = getAbsensiExportRecords(cls, month);
     if (list.length === 0) return toast('Tidak ada data untuk diunduh', 'error');
 
-    const dataSheet = list.map((a, i) => [i + 1, a.date, a.class_id, a.student_name, a.status]);
-    const aoa = [['No', 'Tanggal', 'Kelas', 'Nama Siswa', 'Status Kehadiran'], ...dataSheet];
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    const classLabel = cls || 'Semua Kelas';
+    const periodLabel = getMonthLabelID(month);
+    const downloadDate = formatDateID(getLocalTodayISO());
+    const summary = getAttendanceStatusSummary(list);
+    const grouped = getAttendanceGroupedByClass(list);
+
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Rekap Absen');
-    XLSX.writeFile(wb, `Absensi_${cls||'Semua'}_${month||'Semua'}.xlsx`);
+    wb.Props = {
+        Title: `Rekap Absensi ${classLabel} ${periodLabel}`,
+        Subject: 'Rekapitulasi Absensi Siswa',
+        Author: 'SMP Negeri 1 Ngunut',
+        CreatedDate: new Date()
+    };
+
+    const summaryRows = [
+        ['SMP NEGERI 1 NGUNUT'],
+        ['REKAPITULASI ABSENSI SISWA'],
+        [],
+        ['Kelas', classLabel],
+        ['Periode', periodLabel],
+        ['Tanggal Unduh', downloadDate],
+        ['Total Data Absensi', summary.TOTAL],
+        [],
+        ['Ringkasan Umum'],
+        ['Status', 'Jumlah'],
+        ['Hadir', summary.HADIR],
+        ['Izin', summary.IZIN],
+        ['Sakit', summary.SAKIT],
+        ['Alpa', summary.ALPA],
+        ['Total', summary.TOTAL],
+        [],
+        ['Ringkasan per Kelas'],
+        ['No', 'Kelas', 'Hadir', 'Izin', 'Sakit', 'Alpa', 'Total']
+    ];
+
+    grouped.forEach(([className, rows], index) => {
+        const classSummary = getAttendanceStatusSummary(rows);
+        summaryRows.push([
+            index + 1,
+            className,
+            classSummary.HADIR,
+            classSummary.IZIN,
+            classSummary.SAKIT,
+            classSummary.ALPA,
+            classSummary.TOTAL
+        ]);
+    });
+
+    const wsSummary = XLSX.utils.aoa_to_sheet(summaryRows);
+    wsSummary['!merges'] = [
+        { s: { r: 0, c: 0 }, e: { r: 0, c: 6 } },
+        { s: { r: 1, c: 0 }, e: { r: 1, c: 6 } },
+        { s: { r: 8, c: 0 }, e: { r: 8, c: 1 } },
+        { s: { r: 16, c: 0 }, e: { r: 16, c: 6 } }
+    ];
+    wsSummary['!cols'] = [
+        { wch: 8 }, { wch: 24 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }
+    ];
+    applyWorksheetStyle(wsSummary, [0, 1, 8, 9, 16, 17]);
+    XLSX.utils.book_append_sheet(wb, wsSummary, 'Ringkasan');
+
+    const detailRows = [
+        ['SMP NEGERI 1 NGUNUT'],
+        ['REKAPITULASI ABSENSI SISWA'],
+        [],
+        ['Kelas', classLabel, '', 'Periode', periodLabel],
+        ['Tanggal Unduh', downloadDate, '', 'Total Data', summary.TOTAL],
+        [],
+        ['No', 'Tanggal', 'Kelas', 'INDUK', 'NISN', 'Nama Siswa', 'Status Kehadiran']
+    ];
+    const merges = [
+        { s: { r: 0, c: 0 }, e: { r: 0, c: 6 } },
+        { s: { r: 1, c: 0 }, e: { r: 1, c: 6 } }
+    ];
+    const classHeaderRows = [];
+    let no = 1;
+
+    grouped.forEach(([className, rows]) => {
+        const classHeaderRow = detailRows.length;
+        classHeaderRows.push(classHeaderRow);
+        detailRows.push([`KELAS ${className}`, '', '', '', '', '', '']);
+        merges.push({ s: { r: classHeaderRow, c: 0 }, e: { r: classHeaderRow, c: 6 } });
+        rows.forEach(item => {
+            detailRows.push([
+                no++,
+                formatDateID(item.date),
+                item.class_id || '-',
+                item.nis || '',
+                item.nisn || '',
+                item.student_name || '-',
+                item.status || '-'
+            ]);
+        });
+    });
+
+    const wsDetail = XLSX.utils.aoa_to_sheet(detailRows);
+    wsDetail['!merges'] = merges;
+    wsDetail['!cols'] = [
+        { wch: 6 }, { wch: 18 }, { wch: 14 }, { wch: 14 }, { wch: 16 }, { wch: 34 }, { wch: 18 }
+    ];
+    wsDetail['!autofilter'] = { ref: `A7:G${detailRows.length}` };
+    applyWorksheetStyle(wsDetail, [0, 1, 6, ...classHeaderRows]);
+    XLSX.utils.book_append_sheet(wb, wsDetail, 'Detail Absensi');
+
+    const filename = `Rekap_Absensi_${sanitizeFilename(classLabel)}_${sanitizeFilename(periodLabel)}.xlsx`;
+    XLSX.writeFile(wb, filename);
+    toast('✅ Excel berhasil diunduh dengan format rapi.');
+}
+
+function buildPDFStatusClass(status) {
+    const value = String(status || '').toUpperCase().trim();
+    if (value === 'HADIR') return 'status-hadir';
+    if (value === 'IZIN') return 'status-izin';
+    if (value === 'SAKIT') return 'status-sakit';
+    if (value === 'ALPA') return 'status-alpa';
+    return '';
 }
 
 function downloadRekapPDF(cls, month) {
-    let list = getAttendance();
-    if (cls) list = list.filter(a => a.class_id === cls);
-    if (month) list = list.filter(a => a.date.startsWith(month));
+    const list = getAbsensiExportRecords(cls, month);
     if (list.length === 0) return toast('Data absensi kosong', 'error');
 
-    const html = `<html><head><title>Cetak PDF</title><style>body{font-family:Arial;padding:30px;}table{width:100%;border-collapse:collapse;}th,td{border:1px solid #000;padding:8px;text-align:left;}</style></head><body><h2>REKAPITULASI ABSENSI SISWA</h2><p>Kelas: ${cls||'Semua'} | Bulan: ${month||'Semua'}</p><table><thead><tr><th>Tanggal</th><th>Nama Siswa</th><th>Status</th></tr></thead><tbody>${list.map(a=>`<tr><td>${a.date}</td><td>${a.student_name}</td><td>${a.status}</td></tr>`).join('')}</tbody></table></body></html>`;
+    const classLabel = cls || 'Semua Kelas';
+    const periodLabel = getMonthLabelID(month);
+    const downloadDate = formatDateID(getLocalTodayISO());
+    const summary = getAttendanceStatusSummary(list);
+    const grouped = getAttendanceGroupedByClass(list);
+    const fileTitle = `Rekap Absensi ${classLabel} - ${periodLabel}`;
+
+    const classSummaryRows = grouped.map(([className, rows], index) => {
+        const s = getAttendanceStatusSummary(rows);
+        return `<tr>
+            <td class="text-center">${index + 1}</td>
+            <td>${escapeHTML(className)}</td>
+            <td class="text-center">${s.HADIR}</td>
+            <td class="text-center">${s.IZIN}</td>
+            <td class="text-center">${s.SAKIT}</td>
+            <td class="text-center">${s.ALPA}</td>
+            <td class="text-center strong">${s.TOTAL}</td>
+        </tr>`;
+    }).join('');
+
+    let globalNo = 1;
+    const detailTables = grouped.map(([className, rows]) => {
+        const rowsHTML = rows.map(item => `<tr>
+            <td class="text-center">${globalNo++}</td>
+            <td>${escapeHTML(formatDateID(item.date))}</td>
+            <td>${escapeHTML(item.nis || '-')}</td>
+            <td>${escapeHTML(item.nisn || '-')}</td>
+            <td>${escapeHTML(item.student_name || '-')}</td>
+            <td class="text-center"><span class="status ${buildPDFStatusClass(item.status)}">${escapeHTML(item.status || '-')}</span></td>
+        </tr>`).join('');
+
+        return `<section class="class-section">
+            <div class="class-title">Kelas ${escapeHTML(className)}</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:40px;">No</th>
+                        <th style="width:120px;">Tanggal</th>
+                        <th style="width:90px;">INDUK</th>
+                        <th style="width:110px;">NISN</th>
+                        <th>Nama Siswa</th>
+                        <th style="width:90px;">Status</th>
+                    </tr>
+                </thead>
+                <tbody>${rowsHTML}</tbody>
+            </table>
+        </section>`;
+    }).join('');
+
+    const html = `<!doctype html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<title>${escapeHTML(fileTitle)}</title>
+<style>
+    @page { size: A4 landscape; margin: 12mm; }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, Helvetica, sans-serif; color: #0f172a; margin: 0; background: #f8fafc; font-size: 11px; }
+    .page { max-width: 1120px; margin: 0 auto; padding: 24px; background: #ffffff; min-height: 100vh; }
+    .header { display: flex; justify-content: space-between; gap: 16px; border-bottom: 3px solid #1e40af; padding-bottom: 12px; margin-bottom: 14px; }
+    .school { font-size: 15px; font-weight: 800; letter-spacing: .4px; }
+    .title { font-size: 20px; font-weight: 800; margin-top: 4px; }
+    .subtitle { color: #475569; margin-top: 4px; }
+    .meta { border: 1px solid #cbd5e1; border-radius: 10px; overflow: hidden; min-width: 310px; }
+    .meta table { margin: 0; }
+    .meta td { border: 0; border-bottom: 1px solid #e2e8f0; padding: 7px 10px; }
+    .meta tr:last-child td { border-bottom: 0; }
+    .meta td:first-child { background: #f1f5f9; font-weight: 700; width: 120px; }
+    .summary-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 14px 0; }
+    .summary-card { border: 1px solid #cbd5e1; border-radius: 10px; padding: 10px; text-align: center; background: #f8fafc; }
+    .summary-card .num { font-size: 20px; font-weight: 800; }
+    .summary-card .label { color: #64748b; text-transform: uppercase; font-size: 10px; font-weight: 700; letter-spacing: .3px; }
+    h3 { margin: 18px 0 8px; font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; margin: 0; }
+    th, td { border: 1px solid #cbd5e1; padding: 7px 8px; vertical-align: middle; }
+    th { background: #e2e8f0; font-weight: 800; text-align: left; }
+    tbody tr:nth-child(even) { background: #f8fafc; }
+    .text-center { text-align: center; }
+    .strong { font-weight: 800; }
+    .class-section { margin-top: 14px; page-break-inside: avoid; }
+    .class-title { background: #1e40af; color: #ffffff; padding: 8px 10px; border-radius: 8px 8px 0 0; font-weight: 800; }
+    .status { display: inline-block; min-width: 58px; padding: 3px 7px; border-radius: 999px; font-size: 10px; font-weight: 800; background: #e2e8f0; color: #334155; }
+    .status-hadir { background: #dcfce7; color: #166534; }
+    .status-izin { background: #dbeafe; color: #1d4ed8; }
+    .status-sakit { background: #fef3c7; color: #92400e; }
+    .status-alpa { background: #fee2e2; color: #b91c1c; }
+    .footer { margin-top: 18px; display: flex; justify-content: space-between; color: #64748b; font-size: 10px; }
+    .print-actions { position: sticky; top: 0; background: #ffffff; padding: 10px 0; text-align: right; z-index: 2; }
+    .print-actions button { border: 0; border-radius: 8px; padding: 9px 14px; background: #dc2626; color: #ffffff; font-weight: 700; cursor: pointer; }
+    @media print {
+        body { background: #ffffff; }
+        .page { padding: 0; max-width: none; min-height: auto; }
+        .print-actions { display: none; }
+        thead { display: table-header-group; }
+        tr, .summary-card { page-break-inside: avoid; }
+        .class-section { page-break-inside: auto; }
+    }
+</style>
+</head>
+<body>
+<div class="page">
+    <div class="print-actions"><button onclick="window.print()">Cetak / Simpan PDF</button></div>
+    <div class="header">
+        <div>
+            <div class="school">SMP NEGERI 1 NGUNUT</div>
+            <div class="title">REKAPITULASI ABSENSI SISWA</div>
+            <div class="subtitle">Dokumen rekap absensi berdasarkan filter pada halaman aplikasi.</div>
+        </div>
+        <div class="meta">
+            <table>
+                <tr><td>Kelas</td><td>${escapeHTML(classLabel)}</td></tr>
+                <tr><td>Periode</td><td>${escapeHTML(periodLabel)}</td></tr>
+                <tr><td>Tanggal Unduh</td><td>${escapeHTML(downloadDate)}</td></tr>
+                <tr><td>Total Data</td><td>${summary.TOTAL} catatan</td></tr>
+            </table>
+        </div>
+    </div>
+
+    <div class="summary-grid">
+        <div class="summary-card"><div class="num">${summary.HADIR}</div><div class="label">Hadir</div></div>
+        <div class="summary-card"><div class="num">${summary.IZIN}</div><div class="label">Izin</div></div>
+        <div class="summary-card"><div class="num">${summary.SAKIT}</div><div class="label">Sakit</div></div>
+        <div class="summary-card"><div class="num">${summary.ALPA}</div><div class="label">Alpa</div></div>
+        <div class="summary-card"><div class="num">${summary.TOTAL}</div><div class="label">Total</div></div>
+    </div>
+
+    <h3>Ringkasan per Kelas</h3>
+    <table>
+        <thead>
+            <tr><th style="width:40px;">No</th><th>Kelas</th><th>Hadir</th><th>Izin</th><th>Sakit</th><th>Alpa</th><th>Total</th></tr>
+        </thead>
+        <tbody>${classSummaryRows}</tbody>
+    </table>
+
+    <h3>Detail Absensi</h3>
+    ${detailTables}
+
+    <div class="footer">
+        <span>Dicetak dari Sistem Administrasi Guru SMPN 1 Ngunut</span>
+        <span>${escapeHTML(fileTitle)}</span>
+    </div>
+</div>
+</body>
+</html>`;
+
     const win = window.open('', '_blank');
+    if (!win) return toast('Popup PDF diblokir. Izinkan popup browser terlebih dahulu.', 'error');
+    win.document.open();
     win.document.write(html);
     win.document.close();
-    win.print();
+    win.focus();
+    setTimeout(() => win.print(), 500);
+    toast('✅ Tampilan PDF sudah dirapikan. Pilih Simpan sebagai PDF saat dialog cetak muncul.');
 }
 
 // ============ JURNAL ============
